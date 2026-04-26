@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -504,11 +505,11 @@ func (r *ComputeInstanceReconciler) handleDeprovisioning(ctx context.Context, in
 	}
 }
 
-// resolveSubnetNamespace looks up the Subnet CR referenced by spec.subnetRef
-// and returns the subnet namespace (which equals the Subnet CR name).
+// resolveSubnetTargetNamespace looks up the Subnet CR referenced by spec.subnetRef
+// and returns the subnet target namespace (which equals the Subnet CR name).
 // Returns empty string if subnetRef is not set.
 // Returns error if Subnet CR lookup fails.
-func (r *ComputeInstanceReconciler) resolveSubnetNamespace(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
+func (r *ComputeInstanceReconciler) resolveSubnetTargetNamespace(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
 	log := ctrllog.FromContext(ctx)
 
 	if instance.Spec.SubnetRef == "" {
@@ -529,55 +530,58 @@ func (r *ComputeInstanceReconciler) resolveSubnetNamespace(ctx context.Context, 
 	}
 
 	// Subnet namespace = Subnet CR name (established pattern from Phase 17)
-	subnetNamespace := subnet.Name
+	subnetTargetNamespace := subnet.Name
 
-	log.Info("Resolved subnet namespace from Subnet CR",
+	log.Info("Resolved subnet target namespace from Subnet CR",
 		"subnetRef", instance.Spec.SubnetRef,
-		"subnetNamespace", subnetNamespace,
+		"subnetTargetNamespace", subnetTargetNamespace,
 	)
 
-	return subnetNamespace, nil
+	return subnetTargetNamespace, nil
 }
 
-// syncSubnetNamespaceAnnotation ensures the subnet-namespace annotation is set
+// syncSubnetTargetNamespaceAnnotation ensures the subnet-target-namespace annotation is set
 // when SubnetRef is configured. SubnetRef is immutable, so the annotation only
 // needs to be resolved and written once; subsequent reconciles reuse the cached
 // annotation value. Returns the resolved namespace, whether the annotation was
 // written, and any error.
-func (r *ComputeInstanceReconciler) syncSubnetNamespaceAnnotation(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, bool, error) {
+func (r *ComputeInstanceReconciler) syncSubnetTargetNamespaceAnnotation(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, bool, error) {
 	if instance.Spec.SubnetRef == "" {
 		return "", false, nil
 	}
 
 	// SubnetRef is immutable — if the annotation is already set, reuse it.
-	if ns, ok := instance.Annotations[osacSubnetNamespaceAnnotation]; ok {
+	if ns, ok := instance.Annotations[osacSubnetTargetNamespaceAnnotation]; ok {
 		return ns, false, nil
 	}
 
-	subnetNamespace, err := r.resolveSubnetNamespace(ctx, instance)
+	subnetTargetNamespace, err := r.resolveSubnetTargetNamespace(ctx, instance)
 	if err != nil {
-		return "", false, fmt.Errorf("%w: %w", errSubnetNotFound, err)
+		if apierrors.IsNotFound(err) {
+			return "", false, fmt.Errorf("%w: %w", errSubnetNotFound, err)
+		}
+		return "", false, err
 	}
 	if instance.Annotations == nil {
 		instance.Annotations = make(map[string]string)
 	}
-	instance.Annotations[osacSubnetNamespaceAnnotation] = subnetNamespace
-	return subnetNamespace, true, nil
+	instance.Annotations[osacSubnetTargetNamespaceAnnotation] = subnetTargetNamespace
+	return subnetTargetNamespace, true, nil
 }
 
-// syncMetadataPreflight ensures the finalizer is set and the subnet-namespace
+// syncMetadataPreflight ensures the finalizer is set and the subnet-target-namespace
 // annotation is in sync with the current SubnetRef.  It batches all metadata
 // changes into a single r.Update() call to avoid multiple round-trips and the
-// status-clobbering problem.  The resolved subnetNamespace is returned so
+// status-clobbering problem.  The resolved subnetTargetNamespace is returned so
 // callers can reuse it without a second resolveSubnetNamespace call.
 func (r *ComputeInstanceReconciler) syncMetadataPreflight(ctx context.Context, instance *v1alpha1.ComputeInstance) (string, error) {
 	log := ctrllog.FromContext(ctx)
 
 	metadataChanged := controllerutil.AddFinalizer(instance, osacComputeInstanceFinalizer)
 
-	subnetNamespace, changed, err := r.syncSubnetNamespaceAnnotation(ctx, instance)
+	subnetTargetNamespace, changed, err := r.syncSubnetTargetNamespaceAnnotation(ctx, instance)
 	if err != nil {
-		log.Error(err, "Failed to resolve subnet namespace")
+		log.Error(err, "Failed to resolve subnet target namespace")
 		return "", err
 	}
 	if changed {
@@ -596,13 +600,13 @@ func (r *ComputeInstanceReconciler) syncMetadataPreflight(ctx context.Context, i
 		}
 	}
 
-	return subnetNamespace, nil
+	return subnetTargetNamespace, nil
 }
 
 func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcile.Request, instance *v1alpha1.ComputeInstance) (ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 
-	subnetNamespace, err := r.syncMetadataPreflight(ctx, instance)
+	subnetTargetNamespace, err := r.syncMetadataPreflight(ctx, instance)
 	if err != nil {
 		if errors.Is(err, errSubnetNotFound) {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -643,15 +647,15 @@ func (r *ComputeInstanceReconciler) handleUpdate(ctx context.Context, _ reconcil
 		return ctrl.Result{}, err
 	}
 
-	// When a subnetRef is set, the VM is created in the subnet namespace
-	// (by the AAP playbook), not in the tenant namespace.  Reuse the value
-	// resolved by syncMetadataPreflight to avoid a redundant API call.
-	vmSearchNamespace := tenant.Status.Namespace
-	if subnetNamespace != "" {
-		vmSearchNamespace = subnetNamespace
+	// When a subnetRef is set, the VM is created in the subnet target namespace
+	// (by the AAP playbook), not in the tenant target namespace.  Reuse the
+	// value resolved by syncMetadataPreflight to avoid a redundant API call.
+	targetNamespace := tenant.Status.Namespace
+	if subnetTargetNamespace != "" {
+		targetNamespace = subnetTargetNamespace
 	}
 
-	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, vmSearchNamespace)
+	kv, err := r.findKubeVirtVMs(ctx, targetClient, instance, targetNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
