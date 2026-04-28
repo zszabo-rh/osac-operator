@@ -18,18 +18,21 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/osac-project/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac-operator/internal/provisioning"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
@@ -52,45 +55,59 @@ func makeSC(name, tenant, tier string) *storagev1.StorageClass {
 	}
 }
 
+// deleteTenantSC removes a test StorageClass if it exists.
+func deleteTenantSC(ctx context.Context, name string) {
+	sc := &storagev1.StorageClass{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name}, sc); err == nil {
+		Expect(k8sClient.Delete(ctx, sc)).To(Succeed())
+	}
+}
+
+// mcReconcileRequest wraps a NamespacedName in the mc reconcile request type.
+func mcReconcileRequest(nn types.NamespacedName) mcreconcile.Request {
+	return mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}}
+}
+
+// reconcileUntilDeleting drives reconciliation for a tenant that is being
+// deleted until the namespace reaches Terminating state (envtest limitation:
+// namespaces are never fully deleted).
+func reconcileUntilDeleting(ctx context.Context, nn types.NamespacedName) {
+	Eventually(func(g Gomega) {
+		r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, nil, 0, 0)
+		_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+		g.Expect(err).NotTo(HaveOccurred())
+	}).Should(Succeed())
+}
+
 var _ = Describe("Tenant Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+	Context("When StorageClass already exists (backward compatibility)", func() {
+		const resourceName = "test-tenant-sc-exists"
 
 		ctx := context.Background()
-
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default",
-		}
+		typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: "default"}
 		tenant := &v1alpha1.Tenant{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind Tenant")
-			err := k8sClient.Get(ctx, typeNamespacedName, tenant)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &v1alpha1.Tenant{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					Spec: v1alpha1.TenantSpec{},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			resource := &v1alpha1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
+				Spec: v1alpha1.TenantSpec{},
 			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 		})
 
 		AfterEach(func() {
 			resource := &v1alpha1.Tenant{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance Tenant")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			deleteTenantSC(ctx, resourceName+"-default")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 
 		It("should transition through all Ready/Progressing phases with multi-tier StorageClasses", func() {
 			fakeRecorder := events.NewFakeRecorder(100)
-			controllerReconciler := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster)
+			controllerReconciler := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, nil, 0, 0)
 			controllerReconciler.Recorder = fakeRecorder
 
 			By("waiting for the Tenant to appear in the controller's cache")
@@ -332,6 +349,407 @@ var _ = Describe("Tenant Controller", func() {
 				metav1.ConditionFalse, v1alpha1.TenantReasonMultipleFound,
 			)
 			assertSCConditionMessage("dup-default-1", "dup-default-2")
+		})
+	})
+
+	Context("When no StorageClass exists and provider is configured", func() {
+		const resourceName = "test-tenant-provision"
+
+		ctx := context.Background()
+		nn := types.NamespacedName{Name: resourceName, Namespace: "default"}
+		tenant := &v1alpha1.Tenant{}
+
+		BeforeEach(func() {
+			By("creating the namespace on target cluster")
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, namespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+			}
+
+			By("creating the Tenant CR without a pre-existing StorageClass")
+			err = k8sClient.Get(ctx, nn, tenant)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, &v1alpha1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				})).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			resource := &v1alpha1.Tenant{}
+			if err := k8sClient.Get(ctx, nn, resource); err == nil {
+				deleteTenantSC(ctx, resourceName+"-default")
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				reconcileUntilDeleting(ctx, nn)
+			}
+			ns := &corev1.Namespace{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, ns); err == nil {
+				_ = k8sClient.Delete(ctx, ns)
+			}
+		})
+
+		It("should trigger provisioning and become Ready after SC is created", func() {
+			provider := &mockProvisioningProvider{}
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, provider, 1*time.Second, provisioning.DefaultMaxJobHistory)
+
+			By("first reconcile: trigger provisioning job")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Jobs).NotTo(BeEmpty())
+			}).Should(Succeed())
+
+			By("checking that a provision job was recorded")
+			Expect(tenant.Status.Jobs).To(HaveLen(1))
+			Expect(tenant.Status.Jobs[0].Type).To(Equal(v1alpha1.JobTypeProvision))
+			Expect(tenant.Status.Jobs[0].JobID).To(Equal("mock-job-id"))
+
+			By("simulating: AAP playbook creates the StorageClass")
+			sc := &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName + "-default",
+					Labels: map[string]string{
+						"osac.openshift.io/tenant":       resourceName,
+						"osac.openshift.io/storage-tier": "default",
+					},
+				},
+				Provisioner: "kubernetes.io/no-provisioner",
+			}
+			Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+
+			By("next reconcile: SC found → Ready")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseReady))
+			}).Should(Succeed())
+		})
+	})
+
+	Context("When provisioning job fails", func() {
+		const resourceName = "test-tenant-prov-fail"
+
+		ctx := context.Background()
+		nn := types.NamespacedName{Name: resourceName, Namespace: "default"}
+		tenant := &v1alpha1.Tenant{}
+
+		BeforeEach(func() {
+			By("creating the namespace on target cluster")
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, namespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+			}
+
+			By("creating the Tenant CR")
+			err = k8sClient.Get(ctx, nn, tenant)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, &v1alpha1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				})).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			resource := &v1alpha1.Tenant{}
+			if err := k8sClient.Get(ctx, nn, resource); err == nil {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				reconcileUntilDeleting(ctx, nn)
+			}
+			ns := &corev1.Namespace{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, ns); err == nil {
+				_ = k8sClient.Delete(ctx, ns)
+			}
+		})
+
+		It("should set phase to Failed", func() {
+			provider := &mockProvisioningProvider{
+				getProvisionStatusFunc: func(_ context.Context, _ client.Object, _ string) (provisioning.ProvisionStatus, error) {
+					return provisioning.ProvisionStatus{
+						State:   v1alpha1.JobStateFailed,
+						Message: "backend unreachable",
+					}, nil
+				},
+			}
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, provider, 1*time.Second, provisioning.DefaultMaxJobHistory)
+
+			By("reconciling until job is triggered and fails")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseFailed))
+			}).Should(Succeed())
+
+			By("checking that the failed job was recorded")
+			Expect(provisioning.FindLatestJobByType(tenant.Status.Jobs, v1alpha1.JobTypeProvision)).NotTo(BeNil())
+		})
+	})
+
+	Context("When provisioning trigger itself errors (empty JobID)", func() {
+		const resourceName = "test-tenant-trigger-err"
+
+		ctx := context.Background()
+		nn := types.NamespacedName{Name: resourceName, Namespace: "default"}
+		tenant := &v1alpha1.Tenant{}
+
+		BeforeEach(func() {
+			By("creating the namespace on target cluster")
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, namespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+			}
+
+			By("creating the Tenant CR")
+			err = k8sClient.Get(ctx, nn, tenant)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, &v1alpha1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				})).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			resource := &v1alpha1.Tenant{}
+			if err := k8sClient.Get(ctx, nn, resource); err == nil {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				reconcileUntilDeleting(ctx, nn)
+			}
+			ns := &corev1.Namespace{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, ns); err == nil {
+				_ = k8sClient.Delete(ctx, ns)
+			}
+		})
+
+		It("should record a failed job with empty ID and not retry on next reconcile", func() {
+			triggerCount := 0
+			provider := &mockProvisioningProvider{
+				triggerProvisionFunc: func(_ context.Context, _ client.Object) (*provisioning.ProvisionResult, error) {
+					triggerCount++
+					return nil, fmt.Errorf("connection refused")
+				},
+			}
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, provider, 1*time.Second, provisioning.DefaultMaxJobHistory)
+
+			By("first reconcile: trigger fails, records job with empty JobID")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Jobs).NotTo(BeEmpty())
+			}).Should(Succeed())
+
+			failedJob := provisioning.FindLatestJobByType(tenant.Status.Jobs, v1alpha1.JobTypeProvision)
+			Expect(failedJob).NotTo(BeNil())
+			Expect(failedJob.JobID).To(Equal(""))
+			Expect(failedJob.State).To(Equal(v1alpha1.JobStateFailed))
+
+			By("second reconcile: should NOT re-trigger, should stay Failed")
+			countBefore := triggerCount
+			_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(triggerCount).To(Equal(countBefore), "trigger should not be called again after failure")
+
+			Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+			Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseFailed))
+		})
+	})
+
+	Context("When deleting a Tenant with storage and provider configured", func() {
+		const resourceName = "test-tenant-del-prov"
+
+		ctx := context.Background()
+		nn := types.NamespacedName{Name: resourceName, Namespace: "default"}
+		tenant := &v1alpha1.Tenant{}
+
+		BeforeEach(func() {
+			By("creating the namespace on target cluster")
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, namespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+			}
+
+			By("creating a labeled StorageClass")
+			sc := &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName + "-default",
+					Labels: map[string]string{
+						"osac.openshift.io/tenant":       resourceName,
+						"osac.openshift.io/storage-tier": "default",
+					},
+				},
+				Provisioner: "kubernetes.io/no-provisioner",
+			}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: sc.Name}, &storagev1.StorageClass{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+			}
+
+			By("creating and reconciling the Tenant to Ready")
+			err = k8sClient.Get(ctx, nn, tenant)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, &v1alpha1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				})).To(Succeed())
+			}
+
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, nil, 0, 0)
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseReady))
+			}).Should(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteTenantSC(ctx, resourceName+"-default")
+			ns := &corev1.Namespace{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, ns); err == nil {
+				_ = k8sClient.Delete(ctx, ns)
+			}
+		})
+
+		It("should trigger deprovisioning and record the job", func() {
+			deprovisionCalled := false
+			provider := &mockProvisioningProvider{
+				triggerDeprovisionFunc: func(_ context.Context, _ client.Object) (*provisioning.DeprovisionResult, error) {
+					deprovisionCalled = true
+					return &provisioning.DeprovisionResult{
+						Action: provisioning.DeprovisionTriggered,
+						JobID:  "mock-deprovision-job",
+					}, nil
+				},
+				getDeprovisionStatusFunc: func(_ context.Context, _ client.Object, _ string) (provisioning.ProvisionStatus, error) {
+					return provisioning.ProvisionStatus{
+						State:   v1alpha1.JobStateSucceeded,
+						Message: "Storage cleanup complete",
+					}, nil
+				},
+			}
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, provider, 1*time.Second, provisioning.DefaultMaxJobHistory)
+
+			By("deleting the Tenant CR")
+			Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, tenant)).To(Succeed())
+
+			By("reconciling until deprovisioning triggers")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(deprovisionCalled).To(BeTrue())
+			}).Should(Succeed())
+
+			By("checking that a deprovision job was recorded")
+			Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+			deprovJob := provisioning.FindLatestJobByType(tenant.Status.Jobs, v1alpha1.JobTypeDeprovision)
+			Expect(deprovJob).NotTo(BeNil())
+			Expect(deprovJob.JobID).To(Equal("mock-deprovision-job"))
+		})
+	})
+
+	Context("When deleting a Tenant with storage but no provider", func() {
+		const resourceName = "test-tenant-del-noprov"
+
+		ctx := context.Background()
+		nn := types.NamespacedName{Name: resourceName, Namespace: "default"}
+		tenant := &v1alpha1.Tenant{}
+
+		BeforeEach(func() {
+			By("creating the namespace on target cluster")
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, namespace)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+			}
+
+			By("creating a labeled StorageClass")
+			sc := &storagev1.StorageClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName + "-default",
+					Labels: map[string]string{
+						"osac.openshift.io/tenant":       resourceName,
+						"osac.openshift.io/storage-tier": "default",
+					},
+				},
+				Provisioner: "kubernetes.io/no-provisioner",
+			}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: sc.Name}, &storagev1.StorageClass{})
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+			}
+
+			By("creating and reconciling the Tenant to Ready")
+			err = k8sClient.Get(ctx, nn, tenant)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, &v1alpha1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: "default"},
+				})).To(Succeed())
+			}
+
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, nil, 0, 0)
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseReady))
+			}).Should(Succeed())
+		})
+
+		AfterEach(func() {
+			deleteTenantSC(ctx, resourceName+"-default")
+			ns := &corev1.Namespace{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName}, ns); err == nil {
+				_ = k8sClient.Delete(ctx, ns)
+			}
+		})
+
+		It("should block deletion until StorageClass is manually removed", func() {
+			r := NewTenantReconciler(testMcManager, "default", mcmanager.LocalCluster, nil, 1*time.Second, 0)
+
+			By("deleting the Tenant CR")
+			Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, tenant)).To(Succeed())
+
+			By("reconciling — deletion blocked, waiting for manual SC removal")
+			Eventually(func(g Gomega) {
+				result, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+				g.Expect(tenant.Status.Phase).To(Equal(v1alpha1.TenantPhaseDeleting))
+				g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			}).Should(Succeed())
+
+			By("checking that no deprovision jobs were created")
+			deprovJob := provisioning.FindLatestJobByType(tenant.Status.Jobs, v1alpha1.JobTypeDeprovision)
+			Expect(deprovJob).To(BeNil())
+
+			By("manually removing the StorageClass — deletion should proceed")
+			deleteTenantSC(ctx, resourceName+"-default")
+
+			By("reconciling — SC gone, finalizer removed")
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, mcReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+				// After finalizer removal, the tenant should be deleted by k8s
+				err = k8sClient.Get(ctx, nn, tenant)
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			}).Should(Succeed())
 		})
 	})
 })

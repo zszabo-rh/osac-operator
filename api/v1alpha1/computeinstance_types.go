@@ -333,6 +333,11 @@ type ComputeInstance struct {
 	Status ComputeInstanceStatus `json:"status,omitempty,omitzero"`
 }
 
+// GetStatusJobs returns the job history for provisioning provider integration.
+func (ci *ComputeInstance) GetStatusJobs() []JobStatus {
+	return ci.Status.Jobs
+}
+
 // +kubebuilder:object:root=true
 
 // ComputeInstanceList contains a list of ComputeInstance

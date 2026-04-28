@@ -32,6 +32,8 @@ type TenantPhaseType string
 const (
 	TenantPhaseProgressing TenantPhaseType = "Progressing"
 	TenantPhaseReady       TenantPhaseType = "Ready"
+	TenantPhaseFailed      TenantPhaseType = "Failed"
+	TenantPhaseDeleting    TenantPhaseType = "Deleting"
 )
 
 // TenantConditionType is a valid value for .status.conditions.type
@@ -94,6 +96,9 @@ type TenantStatus struct {
 	// Conditions holds an array of metav1.Condition that describe the state of the Tenant
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+
+	// Jobs holds the history of provisioning jobs triggered for this tenant
+	Jobs []JobStatus `json:"jobs,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -110,6 +115,11 @@ type Tenant struct {
 
 	Spec   TenantSpec   `json:"spec,omitempty"`
 	Status TenantStatus `json:"status,omitempty"`
+}
+
+// GetStatusJobs returns the job history for provisioning provider integration.
+func (t *Tenant) GetStatusJobs() []JobStatus {
+	return t.Status.Jobs
 }
 
 // +kubebuilder:object:root=true
