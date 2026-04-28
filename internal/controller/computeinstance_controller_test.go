@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -1155,7 +1156,7 @@ var _ = Describe("ComputeInstance Controller", func() {
 			instance = &osacv1alpha1.ComputeInstance{}
 		})
 
-		It("sets Provisioned=True and Available=True when VM is Running and Ready", func() {
+		It("sets Provisioned=True and Ready=True when VM is Running and Ready", func() {
 			kv := &kubevirtv1.VirtualMachine{
 				Status: kubevirtv1.VirtualMachineStatus{
 					PrintableStatus: kubevirtv1.VirtualMachineStatusRunning,
@@ -1166,12 +1167,16 @@ var _ = Describe("ComputeInstance Controller", func() {
 			}
 			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
 
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned).Status).To(Equal(metav1.ConditionTrue))
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionAvailable).Status).To(Equal(metav1.ConditionTrue))
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonInfrastructureReady))
+			Expect(provCond.Message).To(Equal("All infrastructure resources provisioned successfully"))
+
+			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionReady).Status).To(Equal(metav1.ConditionTrue))
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired).Status).To(Equal(metav1.ConditionFalse))
 		})
 
-		It("sets Provisioned=True and Available=False when VM is Running but not Ready", func() {
+		It("sets Provisioned=True and Ready=False when VM is Running but not Ready", func() {
 			kv := &kubevirtv1.VirtualMachine{
 				Status: kubevirtv1.VirtualMachineStatus{
 					PrintableStatus: kubevirtv1.VirtualMachineStatusRunning,
@@ -1179,8 +1184,12 @@ var _ = Describe("ComputeInstance Controller", func() {
 			}
 			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
 
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned).Status).To(Equal(metav1.ConditionTrue))
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionAvailable).Status).To(Equal(metav1.ConditionFalse))
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonInfrastructureReady))
+			Expect(provCond.Message).To(Equal("All infrastructure resources provisioned successfully"))
+
+			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionReady).Status).To(Equal(metav1.ConditionFalse))
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired).Status).To(Equal(metav1.ConditionFalse))
 		})
 
@@ -1199,7 +1208,8 @@ var _ = Describe("ComputeInstance Controller", func() {
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired).Status).To(Equal(metav1.ConditionTrue))
 		})
 
-		It("sets Provisioned=False when VM is in Provisioning state (storage not yet allocated)", func() {
+		It("sets Provisioned=False with ProvisioningStorage reason when VM is in Provisioning state", func() {
+			instance.Spec.BootDisk.SizeGiB = 20
 			kv := &kubevirtv1.VirtualMachine{
 				Status: kubevirtv1.VirtualMachineStatus{
 					PrintableStatus: kubevirtv1.VirtualMachineStatusProvisioning,
@@ -1207,9 +1217,195 @@ var _ = Describe("ComputeInstance Controller", func() {
 			}
 			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
 
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned).Status).To(Equal(metav1.ConditionFalse))
-			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionAvailable).Status).To(Equal(metav1.ConditionFalse))
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningStorage))
+			Expect(provCond.Message).To(Equal("Creating DataVolumes for boot disk (20GiB)"))
+
+			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionReady).Status).To(Equal(metav1.ConditionFalse))
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired).Status).To(Equal(metav1.ConditionFalse))
+		})
+	})
+
+	Context("Event emission", func() {
+		const namespaceName = "default"
+
+		ctx := context.Background()
+
+		deleteCI := func(name string) {
+			ci := &osacv1alpha1.ComputeInstance{}
+			nn := types.NamespacedName{Name: name, Namespace: namespaceName}
+			if err := k8sClient.Get(ctx, nn, ci); err == nil {
+				ci.Finalizers = nil
+				_ = k8sClient.Update(ctx, ci)
+				_ = k8sClient.Delete(ctx, ci)
+			}
+		}
+
+		It("should emit TenantNotReady event only on first occurrence", func() {
+			const resourceName = "test-ci-event-tenant"
+			const tenantName = "tenant-event-notready"
+			DeferCleanup(func() { deleteCI(resourceName) })
+			DeferCleanup(func() { deleteTenantInNamespace(ctx, namespaceName, tenantName) })
+
+			tenant := &osacv1alpha1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{Name: tenantName, Namespace: namespaceName},
+			}
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			tenant.Status.Phase = osacv1alpha1.TenantPhaseProgressing
+			Expect(k8sClient.Status().Update(ctx, tenant)).To(Succeed())
+
+			nn := types.NamespacedName{Name: resourceName, Namespace: namespaceName}
+			resource := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: namespaceName,
+					Annotations: map[string]string{
+						osacTenantAnnotation: tenantName,
+					},
+				},
+				Spec: newTestComputeInstanceSpec("test_template"),
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			fakeRecorder := events.NewFakeRecorder(100)
+			controllerReconciler := NewComputeInstanceReconciler(testMcManager, "", namespaceName, &mockProvisioningProvider{name: string(provisioning.ProviderTypeAAP)}, 100*time.Millisecond, 0, mcmanager.LocalCluster)
+			controllerReconciler.Recorder = fakeRecorder
+
+			Eventually(func() error {
+				return controllerReconciler.Client.Get(ctx, nn, &osacv1alpha1.ComputeInstance{})
+			}, 2*time.Second, 10*time.Millisecond).Should(Succeed())
+
+			// First reconcile — should emit TenantNotReady event
+			_, err := controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(fakeRecorder.Events).Should(Receive(And(
+				ContainSubstring("Normal"),
+				ContainSubstring(eventReasonTenantNotReady),
+			)))
+
+			// Wait for the cache to see the updated Provisioned condition
+			Eventually(func(g Gomega) {
+				ci := &osacv1alpha1.ComputeInstance{}
+				g.Expect(controllerReconciler.Client.Get(ctx, nn, ci)).To(Succeed())
+				cond := ci.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonTenantNotReady))
+			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+
+			// Second reconcile — same state, should NOT emit again
+			_, err = controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
+			Expect(err).NotTo(HaveOccurred())
+			Consistently(fakeRecorder.Events, 500*time.Millisecond).ShouldNot(Receive(
+				ContainSubstring(eventReasonTenantNotReady),
+			))
+		})
+
+		It("should set WaitingForVM when tenant becomes Ready without VM", func() {
+			const resourceName = "test-ci-event-waitvm"
+			const tenantName = "tenant-event-waitvm"
+			DeferCleanup(func() { deleteCI(resourceName) })
+			DeferCleanup(func() { deleteTenantInNamespace(ctx, namespaceName, tenantName) })
+
+			tenant := &osacv1alpha1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{Name: tenantName, Namespace: namespaceName},
+			}
+			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			tenant.Status.Phase = osacv1alpha1.TenantPhaseProgressing
+			Expect(k8sClient.Status().Update(ctx, tenant)).To(Succeed())
+
+			nn := types.NamespacedName{Name: resourceName, Namespace: namespaceName}
+			resource := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: namespaceName,
+					Annotations: map[string]string{
+						osacTenantAnnotation: tenantName,
+					},
+				},
+				Spec: newTestComputeInstanceSpec("test_template"),
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			fakeRecorder := events.NewFakeRecorder(100)
+			controllerReconciler := NewComputeInstanceReconciler(testMcManager, "", namespaceName, &mockProvisioningProvider{name: string(provisioning.ProviderTypeAAP)}, 100*time.Millisecond, 0, mcmanager.LocalCluster)
+			controllerReconciler.Recorder = fakeRecorder
+
+			Eventually(func() error {
+				return controllerReconciler.Client.Get(ctx, nn, &osacv1alpha1.ComputeInstance{})
+			}, 2*time.Second, 10*time.Millisecond).Should(Succeed())
+
+			// First reconcile — TenantNotReady event
+			_, err := controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(fakeRecorder.Events).Should(Receive(ContainSubstring(eventReasonTenantNotReady)))
+
+			// Transition tenant to Ready
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: tenantName, Namespace: namespaceName}, tenant)).To(Succeed())
+			tenant.Status.Phase = osacv1alpha1.TenantPhaseReady
+			tenant.Status.Namespace = namespaceName
+			Expect(k8sClient.Status().Update(ctx, tenant)).To(Succeed())
+
+			mgrClient := testMcManager.GetLocalManager().GetClient()
+			Eventually(func(g Gomega) {
+				cached := &osacv1alpha1.Tenant{}
+				g.Expect(mgrClient.Get(ctx, types.NamespacedName{Name: tenantName, Namespace: namespaceName}, cached)).To(Succeed())
+				g.Expect(cached.Status.Phase).To(Equal(osacv1alpha1.TenantPhaseReady))
+			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+
+			// Wait for cache to see Provisioned/TenantNotReady from first reconcile
+			Eventually(func(g Gomega) {
+				ci := &osacv1alpha1.ComputeInstance{}
+				g.Expect(controllerReconciler.Client.Get(ctx, nn, ci)).To(Succeed())
+				cond := ci.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonTenantNotReady))
+			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+
+			// Second reconcile — tenant Ready, no VM -> Provisioned WaitingForVM (no event; condition carries detail)
+			_, err = controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				ci := &osacv1alpha1.ComputeInstance{}
+				g.Expect(controllerReconciler.Client.Get(ctx, nn, ci)).To(Succeed())
+				cond := ci.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonWaitingForVM))
+			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+
+			// Third reconcile — still no VM, reason unchanged
+			_, err = controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				ci := &osacv1alpha1.ComputeInstance{}
+				g.Expect(controllerReconciler.Client.Get(ctx, nn, ci)).To(Succeed())
+				cond := ci.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonWaitingForVM))
+			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+		})
+	})
+
+	Context("conditionReason and conditionStatus helpers", func() {
+		It("conditionReason returns empty string when condition does not exist", func() {
+			instance := &osacv1alpha1.ComputeInstance{}
+			Expect(conditionReason(instance, osacv1alpha1.ComputeInstanceConditionProvisioned)).To(Equal(""))
+		})
+
+		It("conditionReason returns the reason when condition exists", func() {
+			instance := &osacv1alpha1.ComputeInstance{}
+			instance.SetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned, metav1.ConditionFalse, "some message", osacv1alpha1.ReasonWaitingForVM)
+			Expect(conditionReason(instance, osacv1alpha1.ComputeInstanceConditionProvisioned)).To(Equal(osacv1alpha1.ReasonWaitingForVM))
+		})
+
+		It("conditionStatus returns ConditionUnknown when condition does not exist", func() {
+			instance := &osacv1alpha1.ComputeInstance{}
+			Expect(conditionStatus(instance, osacv1alpha1.ComputeInstanceConditionReady)).To(Equal(metav1.ConditionUnknown))
+		})
+
+		It("conditionStatus returns the correct status when condition exists", func() {
+			instance := &osacv1alpha1.ComputeInstance{}
+			instance.SetStatusCondition(osacv1alpha1.ComputeInstanceConditionReady, metav1.ConditionTrue, "", osacv1alpha1.ReasonAsExpected)
+			Expect(conditionStatus(instance, osacv1alpha1.ComputeInstanceConditionReady)).To(Equal(metav1.ConditionTrue))
 		})
 	})
 
@@ -1509,7 +1705,7 @@ var _ = Describe("ComputeInstance Controller", func() {
 				g.Expect(cached.Status.Phase).To(Equal(osacv1alpha1.TenantPhaseReady))
 			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
 
-			// Second reconcile with Ready tenant → Provisioned=False/AsExpected (no KubeVirt VM)
+			// Second reconcile with Ready tenant → Provisioned=False/WaitingForVM (no KubeVirt VM)
 			_, err = controllerReconciler.Reconcile(ctx, mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -1518,8 +1714,8 @@ var _ = Describe("ComputeInstance Controller", func() {
 				cond := ci.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonAsExpected))
-				g.Expect(cond.Message).To(BeEmpty())
+				g.Expect(cond.Reason).To(Equal(osacv1alpha1.ReasonWaitingForVM))
+				g.Expect(cond.Message).To(Equal("VirtualMachine not yet created, waiting for provisioning"))
 			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
 		})
 	})
