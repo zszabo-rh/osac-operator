@@ -224,7 +224,7 @@ func (r *TenantReconciler) handleUpdate(ctx context.Context, req reconcile.Reque
 	// SC found, but if a provision job is still non-terminal, poll it before
 	// declaring Ready — AAP is the source of truth for job status.
 	latestProvJob := provisioning.FindLatestJobByType(instance.Status.Jobs, v1alpha1.JobTypeProvision)
-	if latestProvJob != nil && !latestProvJob.State.IsTerminal() {
+	if latestProvJob != nil && !latestProvJob.State.IsTerminal() && r.ProvisioningProvider != nil {
 		return r.pollProvisionJob(ctx, instance, latestProvJob)
 	}
 

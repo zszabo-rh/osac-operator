@@ -462,7 +462,8 @@ func setupTenantController(mgr mcmanager.Manager, maxJobHistory int) error {
 				"deprovisionTemplate", tenantDeprovisionTemplate)
 		}
 	case provisioning.ProviderTypeEDA:
-		setupLog.Info("EDA provider does not support tenant storage provisioning, controller will wait for manual StorageClass creation")
+		setupLog.Info("EDA provider does not support tenant storage provisioning, " +
+			"controller will wait for manual StorageClass creation")
 	default:
 		return fmt.Errorf("unknown provisioning provider type: %s", providerType)
 	}
