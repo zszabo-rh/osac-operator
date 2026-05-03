@@ -48,18 +48,6 @@ spec:
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
-		By("building the operator image")
-		operatorImage := "ghcr.io/osac-project/osac-operator:latest"
-		cmd = exec.Command("make", "image-build",
-			fmt.Sprintf("IMG=%s", operatorImage),
-		)
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
-
-		By("loading the operator image into the kind cluster")
-		err = utils.LoadImageToKindClusterWithName(operatorImage)
-		Expect(err).NotTo(HaveOccurred())
-
 		By("deploying the console-proxy")
 		cmd = exec.Command("kubectl", "apply", "-k", "config/console-proxy")
 		_, err = utils.Run(cmd)
