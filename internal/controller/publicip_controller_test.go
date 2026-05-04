@@ -29,6 +29,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac-operator/api/v1alpha1"
@@ -675,6 +676,156 @@ var _ = Describe("PublicIPReconciler", func() {
 			result, err := reconciler.Reconcile(testCtx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+		})
+	})
+
+	Context("mapComputeInstanceToPublicIPs", func() {
+		const (
+			mapTestCINamespace = "osac-computeinstance"
+			mapTestCIUUID      = "ci-map-uuid-789"
+		)
+
+		It("should return requests for PublicIPs referencing the ComputeInstance UUID", func() {
+			matchingIP := &osacv1alpha1.PublicIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip-matching",
+					Namespace: testNamespace,
+				},
+				Spec: osacv1alpha1.PublicIPSpec{
+					Pool:            testPoolUUID,
+					ComputeInstance: mapTestCIUUID,
+				},
+			}
+			unrelatedIP := &osacv1alpha1.PublicIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip-unrelated",
+					Namespace: testNamespace,
+				},
+				Spec: osacv1alpha1.PublicIPSpec{
+					Pool:            testPoolUUID,
+					ComputeInstance: "other-ci-uuid",
+				},
+			}
+
+			mapClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(matchingIP, unrelatedIP).
+				Build()
+
+			reconciler.Client = mapClient
+			reconciler.NetworkingNamespace = testNamespace
+			reconciler.ComputeInstanceNamespace = mapTestCINamespace
+
+			ci := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-ci",
+					Namespace: mapTestCINamespace,
+					Labels: map[string]string{
+						osacComputeInstanceIDLabel: mapTestCIUUID,
+					},
+				},
+			}
+
+			requests := reconciler.mapComputeInstanceToPublicIPs(testCtx, ci)
+			Expect(requests).To(HaveLen(1))
+			Expect(requests[0].NamespacedName).To(Equal(types.NamespacedName{
+				Name:      "ip-matching",
+				Namespace: testNamespace,
+			}))
+		})
+
+		It("should return nil when ComputeInstance has no UUID label", func() {
+			ci := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ci-no-label",
+					Namespace: mapTestCINamespace,
+				},
+			}
+
+			requests := reconciler.mapComputeInstanceToPublicIPs(testCtx, ci)
+			Expect(requests).To(BeNil())
+		})
+
+		It("should return empty when no PublicIPs reference the ComputeInstance", func() {
+			unrelatedIP := &osacv1alpha1.PublicIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip-no-match",
+					Namespace: testNamespace,
+				},
+				Spec: osacv1alpha1.PublicIPSpec{
+					Pool:            testPoolUUID,
+					ComputeInstance: "different-uuid",
+				},
+			}
+
+			mapClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(unrelatedIP).
+				Build()
+
+			reconciler.Client = mapClient
+			reconciler.NetworkingNamespace = testNamespace
+
+			ci := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ci-no-matches",
+					Namespace: mapTestCINamespace,
+					Labels: map[string]string{
+						osacComputeInstanceIDLabel: mapTestCIUUID,
+					},
+				},
+			}
+
+			requests := reconciler.mapComputeInstanceToPublicIPs(testCtx, ci)
+			Expect(requests).To(BeEmpty())
+		})
+
+		It("should return multiple requests when several PublicIPs reference the same ComputeInstance", func() {
+			ip1 := &osacv1alpha1.PublicIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip-multi-1",
+					Namespace: testNamespace,
+				},
+				Spec: osacv1alpha1.PublicIPSpec{
+					Pool:            testPoolUUID,
+					ComputeInstance: mapTestCIUUID,
+				},
+			}
+			ip2 := &osacv1alpha1.PublicIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ip-multi-2",
+					Namespace: testNamespace,
+				},
+				Spec: osacv1alpha1.PublicIPSpec{
+					Pool:            testPoolUUID,
+					ComputeInstance: mapTestCIUUID,
+				},
+			}
+
+			mapClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(ip1, ip2).
+				Build()
+
+			reconciler.Client = mapClient
+			reconciler.NetworkingNamespace = testNamespace
+
+			ci := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ci-multi",
+					Namespace: mapTestCINamespace,
+					Labels: map[string]string{
+						osacComputeInstanceIDLabel: mapTestCIUUID,
+					},
+				},
+			}
+
+			requests := reconciler.mapComputeInstanceToPublicIPs(testCtx, ci)
+			Expect(requests).To(HaveLen(2))
+			Expect(requests).To(ContainElements(
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: "ip-multi-1", Namespace: testNamespace}},
+				reconcile.Request{NamespacedName: types.NamespacedName{Name: "ip-multi-2", Namespace: testNamespace}},
+			))
 		})
 	})
 
