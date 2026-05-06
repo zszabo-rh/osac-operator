@@ -10,4 +10,4 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: osac-console-proxy
-  namespace: osac
+  namespace: osac  # Must match namespace in config/console-proxy/kustomization.yaml

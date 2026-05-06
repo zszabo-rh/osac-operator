@@ -19,7 +19,7 @@ spec:
       containers:
       - name: console-proxy
         image: console-proxy
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         command:
         - /console-proxy
         args:

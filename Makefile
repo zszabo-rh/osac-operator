@@ -133,6 +133,8 @@ test-kustomize: kustomize ## Validate kustomize configurations (catches missing 
 	$(KUSTOMIZE) build config/samples > /dev/null
 	$(KUSTOMIZE) build config/default > /dev/null
 	$(KUSTOMIZE) build config/console-proxy > /dev/null
+	$(KUSTOMIZE) build config/testing/default > /dev/null
+	$(KUSTOMIZE) build config/testing/console-proxy > /dev/null
 	@echo "All kustomize configurations are valid"
 
 .PHONY: test-smoke
@@ -234,14 +236,16 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -k config/crd
 
+DEPLOY_OVERLAY ?= config/default
+
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUBECTL) apply -k config/default
+	$(KUBECTL) apply -k $(DEPLOY_OVERLAY)
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -k config/default
+	$(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -k $(DEPLOY_OVERLAY)
 
 ##@ Dependencies
 

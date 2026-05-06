@@ -65,7 +65,7 @@ spec:
           - --health-probe-bind-address=:8081
           - --grpc-insecure
         image: controller:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         name: manager
         envFrom:
           - secretRef:

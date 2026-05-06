@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
@@ -51,12 +52,6 @@ func InstallPrometheusOperator() error {
 func Run(cmd *exec.Cmd) ([]byte, error) {
 	dir, _ := GetProjectDir()
 	cmd.Dir = dir
-
-	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %s\n", err)
-	}
-
-	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %s\n", command)
 	output, err := cmd.CombinedOutput()
@@ -167,10 +162,18 @@ func GetNonEmptyLines(output string) []string {
 
 // GetProjectDir will return the directory where the project is
 func GetProjectDir() (string, error) {
-	wd, err := os.Getwd()
+	dir, err := os.Getwd()
 	if err != nil {
-		return wd, err
+		return "", err
 	}
-	wd = strings.ReplaceAll(wd, "/test/e2e", "")
-	return wd, nil
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("could not find project root (no go.mod)")
+		}
+		dir = parent
+	}
 }

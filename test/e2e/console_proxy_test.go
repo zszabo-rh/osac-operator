@@ -40,24 +40,27 @@ var _ = Describe("Console Proxy", Ordered, func() {
 		}
 
 		By("creating a self-signed ClusterIssuer for cert-manager")
-		cmd = exec.Command("kubectl", "apply", "-f", "-")
-		cmd.Stdin = strings.NewReader(`apiVersion: cert-manager.io/v1
+		createClusterIssuer := func() error {
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(`apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
   name: default-ca
 spec:
   selfSigned: {}
 `)
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred())
+			_, err := utils.Run(cmd)
+			return err
+		}
+		Eventually(createClusterIssuer, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("deploying the console-proxy")
-		cmd = exec.Command("kubectl", "apply", "-k", "config/console-proxy")
+		cmd = exec.Command("kubectl", "apply", "-k", "config/testing/console-proxy")
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("creating auth-reader RoleBinding in kube-system")
-		cmd = exec.Command("kubectl", "apply", "-f", "config/console-proxy/auth-reader-rolebinding.yaml")
+		cmd = exec.Command("kubectl", "apply", "-k", "config/console-proxy-kube-system/")
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -82,12 +85,12 @@ spec:
 
 	AfterAll(func() {
 		By("removing console-proxy resources")
-		cmd := exec.Command("kubectl", "delete", "-k", "config/console-proxy", "--ignore-not-found")
+		cmd := exec.Command("kubectl", "delete", "-k", "config/testing/console-proxy", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("removing auth-reader RoleBinding from kube-system")
-		cmd = exec.Command("kubectl", "delete", "-f",
-			"config/console-proxy/auth-reader-rolebinding.yaml", "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "-k",
+			"config/console-proxy-kube-system/", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("removing the self-signed ClusterIssuer")

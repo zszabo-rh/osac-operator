@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	operatorImage     = "ghcr.io/osac-project/osac-operator:latest"
+	operatorImage     = "localhost/osac-operator:latest"
 	operatorNamespace = "osac-operator-system"
 )
 
@@ -63,7 +63,7 @@ var _ = BeforeSuite(func() {
 	}
 
 	By("deploying the controller-manager")
-	cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", operatorImage))
+	cmd = exec.Command("kubectl", "apply", "-k", "config/testing/default")
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -104,7 +104,7 @@ var _ = BeforeSuite(func() {
 
 var _ = AfterSuite(func() {
 	By("undeploying the controller-manager")
-	cmd := exec.Command("make", "undeploy")
+	cmd := exec.Command("kubectl", "delete", "-k", "config/testing/default", "--ignore-not-found")
 	_, _ = utils.Run(cmd)
 
 	By("removing manager namespace")

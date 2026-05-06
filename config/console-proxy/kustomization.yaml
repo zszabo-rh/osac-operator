@@ -7,6 +7,9 @@ labels:
   pairs:
     app: osac-console-proxy
 
+# auth-reader-rolebinding.yaml lives in ../console-proxy-kube-system/ because
+# it targets kube-system; including it here would let the namespace transformer
+# overwrite that. The installer applies it separately.
 resources:
 - serviceaccount.yaml
 - deployment.yaml

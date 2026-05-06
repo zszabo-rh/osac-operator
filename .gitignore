@@ -5,6 +5,7 @@
 *.so
 *.dylib
 bin/*
+console-proxy
 main
 Containerfile.cross
 Dockerfile.manifests
