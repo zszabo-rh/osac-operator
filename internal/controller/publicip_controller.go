@@ -586,19 +586,22 @@ func (r *PublicIPReconciler) routeProvisioning(ctx context.Context, publicIP *v1
 	case v1alpha1.PublicIPStateReleasing:
 		return r.handleDetaching(ctx, publicIP, priorCIUUID)
 	case v1alpha1.PublicIPStateFailed:
-		// Determine which handler owns the failure by inspecting the latest
-		// failed job type. Without this, a failed attach would fall through to
-		// handleProvisioning and re-run osac-create-public-ip while the MetalLB
-		// Service is partially moved to the VM namespace.
+		// Route based on the latest failed job type AND current spec intent.
+		// Checking both prevents re-triggering the wrong operation after the
+		// user changes spec.computeInstance following a failure (e.g., failed
+		// attach then user clears CI: we should not re-trigger handleAttaching
+		// with an empty target).
 		latestAttach := provisioning.FindLatestJobByType(publicIP.Status.Jobs, v1alpha1.JobTypeAttach)
-		if latestAttach != nil && latestAttach.State == v1alpha1.JobStateFailed {
+		if latestAttach != nil && latestAttach.State == v1alpha1.JobStateFailed && publicIP.Spec.ComputeInstance != "" {
 			return r.handleAttaching(ctx, publicIP)
 		}
 		latestDetach := provisioning.FindLatestJobByType(publicIP.Status.Jobs, v1alpha1.JobTypeDetach)
-		if latestDetach != nil && latestDetach.State == v1alpha1.JobStateFailed {
+		if latestDetach != nil && latestDetach.State == v1alpha1.JobStateFailed && publicIP.Spec.ComputeInstance == "" {
 			return r.handleDetaching(ctx, publicIP, priorCIUUID)
 		}
-		// Provision failure: handleProvisioning provides backoff/retry
+		// Provision failure or spec intent changed after attach/detach failure:
+		// handleProvisioning provides backoff/retry for provision failures,
+		// and config version mismatch triggers re-provisioning for spec changes.
 		return r.handleProvisioning(ctx, publicIP, priorCIUUID)
 	default:
 		return r.handleProvisioning(ctx, publicIP, priorCIUUID)
@@ -760,6 +763,12 @@ func (r *PublicIPReconciler) handleDetaching(ctx context.Context, publicIP *v1al
 			log.Info("provider skipped detach")
 			publicIP.Status.Phase = v1alpha1.PublicIPPhaseReady
 			publicIP.Status.State = v1alpha1.PublicIPStateAllocated
+			if priorCIUUID != "" {
+				if err := r.maybeRemoveCIFinalizer(ctx, priorCIUUID, ""); err != nil {
+					log.Error(err, "failed to remove CI finalizer after skipped detach",
+						"computeInstanceUUID", priorCIUUID)
+				}
+			}
 			return ctrl.Result{}, nil
 		case provisioning.DeprovisionTriggered:
 			newJob := v1alpha1.JobStatus{
