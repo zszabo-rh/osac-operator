@@ -10,3 +10,9 @@ rules:
   verbs:
   - get
   - list
+- apiGroups:
+  - subresources.kubevirt.io
+  resources:
+  - virtualmachineinstances/console
+  verbs:
+  - get
