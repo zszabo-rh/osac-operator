@@ -1210,6 +1210,117 @@ var _ = Describe("ComputeInstance Controller", func() {
 		)
 	})
 
+	Context("provisioningErrorMessage", func() {
+		DescribeTable("returns error message for failure states and empty for non-failure states",
+			func(kv *kubevirtv1.VirtualMachine, expectedMsg string) {
+				Expect(provisioningErrorMessage(kv)).To(Equal(expectedMsg))
+			},
+			Entry("DataVolumeError with condition detail",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusDataVolumeError,
+						Conditions: []kubevirtv1.VirtualMachineCondition{
+							{Type: "DataVolumesReady", Status: corev1.ConditionFalse, Message: "Not all of the VMI's DVs are ready"},
+						},
+					},
+				},
+				"Boot disk provisioning failed: Not all of the VMI's DVs are ready"),
+			Entry("DataVolumeError without conditions",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusDataVolumeError,
+					},
+				},
+				"Boot disk provisioning failed"),
+			Entry("ErrorPvcNotFound",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusPvcNotFound,
+					},
+				},
+				"Boot disk provisioning failed: PVC not found"),
+			Entry("ErrorUnschedulable",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusUnschedulable,
+					},
+				},
+				"VM scheduling failed: unschedulable"),
+			Entry("CrashLoopBackOff",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusCrashLoopBackOff,
+					},
+				},
+				"VM is in CrashLoopBackOff"),
+			Entry("ErrImagePull",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusErrImagePull,
+					},
+				},
+				"VM image pull failed"),
+			Entry("ImagePullBackOff",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusImagePullBackOff,
+					},
+				},
+				"VM image pull failed"),
+			Entry("Terminating",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusTerminating,
+					},
+				},
+				"VM is terminating unexpectedly"),
+			Entry("Running returns empty",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusRunning,
+					},
+				},
+				""),
+			Entry("Stopped returns empty",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusStopped,
+					},
+				},
+				""),
+			Entry("Provisioning returns empty",
+				&kubevirtv1.VirtualMachine{
+					Status: kubevirtv1.VirtualMachineStatus{
+						PrintableStatus: kubevirtv1.VirtualMachineStatusProvisioning,
+					},
+				},
+				""),
+		)
+	})
+
+	Context("isOperationalStatus", func() {
+		DescribeTable("returns true for known operational statuses and false otherwise",
+			func(status kubevirtv1.VirtualMachinePrintableStatus, expected bool) {
+				Expect(isOperationalStatus(status)).To(Equal(expected))
+			},
+			Entry("Running", kubevirtv1.VirtualMachineStatusRunning, true),
+			Entry("Stopped", kubevirtv1.VirtualMachineStatusStopped, true),
+			Entry("Paused", kubevirtv1.VirtualMachineStatusPaused, true),
+			Entry("Starting", kubevirtv1.VirtualMachineStatusStarting, true),
+			Entry("WaitingForVolumeBinding", kubevirtv1.VirtualMachineStatusWaitingForVolumeBinding, true),
+			Entry("Migrating", kubevirtv1.VirtualMachineStatusMigrating, true),
+			Entry("WaitingForReceiver", kubevirtv1.VirtualMachineStatusWaitingForReceiver, true),
+			Entry("Stopping", kubevirtv1.VirtualMachineStatusStopping, true),
+			Entry("Unknown", kubevirtv1.VirtualMachineStatusUnknown, true),
+			Entry("Provisioning is not operational", kubevirtv1.VirtualMachineStatusProvisioning, false),
+			Entry("DataVolumeError is not operational", kubevirtv1.VirtualMachineStatusDataVolumeError, false),
+			Entry("CrashLoopBackOff is not operational", kubevirtv1.VirtualMachineStatusCrashLoopBackOff, false),
+			Entry("Terminating is not operational", kubevirtv1.VirtualMachineStatusTerminating, false),
+			Entry("empty string is not operational", kubevirtv1.VirtualMachinePrintableStatus(""), false),
+			Entry("unknown future status is not operational", kubevirtv1.VirtualMachinePrintableStatus("SomeFutureStatus"), false),
+		)
+	})
+
 	Context("handleKubeVirtVM", func() {
 		var (
 			ctx          context.Context
@@ -1295,6 +1406,84 @@ var _ = Describe("ComputeInstance Controller", func() {
 
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionReady).Status).To(Equal(metav1.ConditionFalse))
 			Expect(instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionRestartRequired).Status).To(Equal(metav1.ConditionFalse))
+		})
+
+		It("sets Provisioned=False with error detail when VM has DataVolumeError", func() {
+			kv := &kubevirtv1.VirtualMachine{
+				Status: kubevirtv1.VirtualMachineStatus{
+					PrintableStatus: kubevirtv1.VirtualMachineStatusDataVolumeError,
+					Conditions: []kubevirtv1.VirtualMachineCondition{
+						{
+							Type:    "DataVolumesReady",
+							Status:  corev1.ConditionFalse,
+							Reason:  "NotAllDVsReady",
+							Message: "Not all of the VMI's DVs are ready",
+						},
+					},
+				},
+			}
+			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
+
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
+			Expect(provCond.Message).To(Equal("Boot disk provisioning failed: Not all of the VMI's DVs are ready"))
+		})
+
+		It("sets Provisioned=False with generic message when DataVolumeError has no condition detail", func() {
+			kv := &kubevirtv1.VirtualMachine{
+				Status: kubevirtv1.VirtualMachineStatus{
+					PrintableStatus: kubevirtv1.VirtualMachineStatusDataVolumeError,
+				},
+			}
+			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
+
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
+			Expect(provCond.Message).To(Equal("Boot disk provisioning failed"))
+		})
+
+		It("sets Provisioned=False when VM has ErrorPvcNotFound", func() {
+			kv := &kubevirtv1.VirtualMachine{
+				Status: kubevirtv1.VirtualMachineStatus{
+					PrintableStatus: kubevirtv1.VirtualMachineStatusPvcNotFound,
+				},
+			}
+			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
+
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
+			Expect(provCond.Message).To(ContainSubstring("Boot disk provisioning failed: PVC not found"))
+		})
+
+		It("sets Provisioned=False when VM is ErrorUnschedulable", func() {
+			kv := &kubevirtv1.VirtualMachine{
+				Status: kubevirtv1.VirtualMachineStatus{
+					PrintableStatus: kubevirtv1.VirtualMachineStatusUnschedulable,
+				},
+			}
+			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
+
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
+			Expect(provCond.Message).To(ContainSubstring("VM scheduling failed"))
+		})
+
+		It("sets Provisioned=False for unknown PrintableStatus", func() {
+			kv := &kubevirtv1.VirtualMachine{
+				Status: kubevirtv1.VirtualMachineStatus{
+					PrintableStatus: kubevirtv1.VirtualMachinePrintableStatus("SomeFutureErrorStatus"),
+				},
+			}
+			Expect(reconciler.handleKubeVirtVM(ctx, targetClient, instance, kv)).To(Succeed())
+
+			provCond := instance.GetStatusCondition(osacv1alpha1.ComputeInstanceConditionProvisioned)
+			Expect(provCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(provCond.Reason).To(Equal(osacv1alpha1.ReasonProvisioningFailed))
+			Expect(provCond.Message).To(Equal("VM entered unexpected status: SomeFutureErrorStatus"))
 		})
 	})
 
