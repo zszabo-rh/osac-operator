@@ -222,13 +222,16 @@ func (p *AAPProvider) isReadyForDeprovision(ctx context.Context, resource client
 	// Check if this is an EDA job ID (provider switch scenario)
 	// EDA job IDs start with "eda-webhook-", AAP job IDs are numeric
 	if IsEDAJobID(latestProvisionJob.JobID) {
+		// EDA jobs can't be queried via AAP API or cancelled by AAP provider.
+		// For ComputeInstance/ClusterOrder, we check the resource phase to determine
+		// if provisioning is complete. For other resources (e.g., Tenant), we treat
+		// EDA jobs as terminal since EDA is only used for CI/ClusterOrder today.
 		phase, err := getResourcePhase(resource)
 		if err != nil {
-			return false, nil, err
+			log.Error(err, "EDA provision job on unsupported resource type, treating as terminal", "jobID", latestProvisionJob.JobID)
+			return true, nil, nil
 		}
 		log.Info("detected EDA provision job (provider switch scenario), checking resource phase", "jobID", latestProvisionJob.JobID, "phase", phase)
-		// EDA jobs can't be queried via AAP API or cancelled by AAP provider
-		// Check the resource phase to determine if provisioning is complete
 
 		// Ready/Running or Failed - provision is done, ready to deprovision
 		if ready, err := isResourceReady(resource); err != nil {
@@ -248,14 +251,11 @@ func (p *AAPProvider) isReadyForDeprovision(ctx context.Context, resource client
 		if deleting, err := isResourceDeleting(resource); err != nil {
 			return false, nil, err
 		} else if deleting {
-			// Check if deprovision job exists
 			latestDeprovisionJob := FindLatestJobByType(jobs, v1alpha1.JobTypeDeprovision)
 			if latestDeprovisionJob == nil {
-				// No deprovision job yet - this is the initial deletion, ready to create deprovision job
 				log.Info("EDA provision complete, deletion initiated, ready to create deprovision job", "jobID", latestProvisionJob.JobID, "phase", phase)
 				return true, nil, nil
 			}
-			// Deprovision job already exists - not ready (already in progress)
 			log.Info("EDA provision complete, deprovision job already exists", "jobID", latestProvisionJob.JobID, "deprovisionJobID", latestDeprovisionJob.JobID, "phase", phase)
 			return false, nil, nil
 		}

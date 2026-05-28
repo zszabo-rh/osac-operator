@@ -101,6 +101,10 @@ const (
 	envPublicIPAttachWebhook = "OSAC_PUBLIC_IP_ATTACH_WEBHOOK"
 	envPublicIPDetachWebhook = "OSAC_PUBLIC_IP_DETACH_WEBHOOK"
 
+	// Tenant-specific AAP template overrides (default: osac-create-org / osac-delete-org)
+	envTenantAAPProvisionTemplate   = "OSAC_TENANT_AAP_PROVISION_TEMPLATE"
+	envTenantAAPDeprovisionTemplate = "OSAC_TENANT_AAP_DEPROVISION_TEMPLATE"
+
 	// Job history configuration
 	envMaxJobHistory = "OSAC_MAX_JOB_HISTORY"
 
@@ -422,13 +426,55 @@ func setupComputeInstanceControllers(
 }
 
 // setupTenantController registers the Tenant controller.
-func setupTenantController(mgr mcmanager.Manager) error {
+// For AAP provider, it creates tenant-specific templates (osac-create-org / osac-delete-org).
+// For EDA, tenant provisioning is not supported — the controller waits for a manually-created StorageClass.
+func setupTenantController(mgr mcmanager.Manager, maxJobHistory int) error {
 	targetCluster := targetClusterFromManager(mgr)
 	tenantNamespace := os.Getenv(envTenantNamespace)
+
+	var tenantProvider provisioning.ProvisioningProvider
+	var tenantPollInterval time.Duration
+
+	providerType := provisioning.ProviderType(os.Getenv(envProvisioningProvider))
+	if providerType == "" {
+		providerType = provisioning.ProviderTypeAAP
+	}
+
+	switch providerType {
+	case provisioning.ProviderTypeAAP:
+		aapURL := os.Getenv(envAAPURL)
+		aapToken := os.Getenv(envAAPToken)
+		if aapURL != "" && aapToken != "" {
+			tenantProvisionTemplate := helpers.GetEnvWithDefault(envTenantAAPProvisionTemplate, "osac-create-org")
+			tenantDeprovisionTemplate := helpers.GetEnvWithDefault(envTenantAAPDeprovisionTemplate, "osac-delete-org")
+			aapInsecureSkipVerify := helpers.GetEnvWithDefault(envAAPInsecureSkipVerify, false)
+
+			var err error
+			tenantProvider, tenantPollInterval, err = createAAPProvider(
+				aapURL, aapToken, tenantProvisionTemplate, tenantDeprovisionTemplate,
+				"", aapInsecureSkipVerify,
+			)
+			if err != nil {
+				return fmt.Errorf("tenant provisioning provider: %w", err)
+			}
+			setupLog.Info("tenant storage provisioning configured",
+				"provisionTemplate", tenantProvisionTemplate,
+				"deprovisionTemplate", tenantDeprovisionTemplate)
+		}
+	case provisioning.ProviderTypeEDA:
+		setupLog.Info("EDA provider does not support tenant storage provisioning, " +
+			"controller will wait for manual StorageClass creation")
+	default:
+		return fmt.Errorf("unknown provisioning provider type: %s", providerType)
+	}
+
 	if err := (controller.NewTenantReconciler(
 		mgr,
 		tenantNamespace,
 		targetCluster,
+		tenantProvider,
+		tenantPollInterval,
+		maxJobHistory,
 	)).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("tenant controller: %w", err)
 	}
@@ -788,7 +834,7 @@ func main() {
 		}
 	}
 	if ctrlFlags.Tenant {
-		if err := setupTenantController(mgr); err != nil {
+		if err := setupTenantController(mgr, maxJobHistory); err != nil {
 			setupLog.Error(err, "unable to setup tenant controller")
 			os.Exit(1)
 		}
