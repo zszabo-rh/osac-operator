@@ -72,8 +72,6 @@ spec:
               name: osac-config
               optional: true
         env:
-          - name: OSAC_PROVISIONING_PROVIDER
-            value: "aap"
           - name: OSAC_CLUSTER_ORDER_NAMESPACE
             valueFrom:
               fieldRef:

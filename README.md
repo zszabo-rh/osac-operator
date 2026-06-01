@@ -27,29 +27,10 @@ custom resources and reconciles them to their desired state:
 Configuration is supplied via environment variables (e.g. from a Secret mounted
 into the manager deployment). The following are supported:
 
-### Provisioning providers
+### AAP provisioning
 
-The operator supports two provisioning providers. The provider is selected
-**per-deployment** (not per-resource-type) and applies to all controllers that
-perform provisioning (ClusterOrder, ComputeInstance). Networking controllers
-(VirtualNetwork, Subnet, SecurityGroup) always use AAP.
-
-- `OSAC_PROVISIONING_PROVIDER` — `"eda"` or `"aap"` (default: `"aap"`).
-  Ignored by networking controllers, which always use AAP.
-
-**EDA provider** — triggers external automation via webhooks. Job IDs are
-synthetic (`eda-webhook-N`). The EDA provider cannot poll for job status;
-completion is tracked via resource phase changes and finalizers.
-
-- `OSAC_CLUSTER_CREATE_WEBHOOK` — webhook URL for cluster provisioning.
-- `OSAC_CLUSTER_DELETE_WEBHOOK` — webhook URL for cluster deprovisioning.
-- `OSAC_COMPUTE_INSTANCE_PROVISION_WEBHOOK` — webhook URL for compute instance
-  provisioning.
-- `OSAC_COMPUTE_INSTANCE_DEPROVISION_WEBHOOK` — webhook URL for compute instance
-  deprovisioning.
-
-**AAP provider** — integrates directly with the Ansible Automation Platform REST
-API. Launches job/workflow templates and polls AAP for job status.
+All controllers provision infrastructure via direct Ansible Automation Platform REST
+API integration. The operator launches job/workflow templates and polls AAP for job status.
 
 - `OSAC_AAP_URL` — AAP server URL (required).
 - `OSAC_AAP_TOKEN` — AAP authentication token (required).
@@ -101,8 +82,6 @@ Networking controllers derive template names from the prefix:
 - `OSAC_FULFILLMENT_SERVER_ADDRESS` — fulfillment service gRPC address
   (e.g. `fulfillment-service:50051`).
 - `OSAC_FULFILLMENT_TOKEN_FILE` — path to file containing the gRPC auth token.
-- `OSAC_MINIMUM_REQUEST_INTERVAL` — minimum duration between calls to the same
-  webhook URL (optional). Duration string, default: `0`.
 
 ### Controller enable flags
 

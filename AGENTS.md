@@ -54,15 +54,11 @@ make undeploy
 
 ### Dual-Controller Pattern
 
-Each resource has a **resource controller** (provisions via AAP/EDA, manages finalizers) and a **feedback controller** (syncs state to fulfillment-service via gRPC). See `.claude/rules/controller-patterns.md` for reconciliation, finalizer, and AAP integration patterns.
+Each resource has a **resource controller** (provisions via AAP, manages finalizers) and a **feedback controller** (syncs state to fulfillment-service via gRPC). See `.claude/rules/controller-patterns.md` for reconciliation, finalizer, and AAP integration patterns.
 
-### Provisioning Providers
+### Provisioning
 
-Two backends via `ProvisioningProvider` interface (`pkg/provisioning/provider.go`):
-- **AAP** (`pkg/aap/client.go`) — direct AAP REST API integration
-- **EDA** (`pkg/provisioning/eda_provider.go`) — webhook-based triggers
-
-Selected via `OSAC_PROVISIONING_PROVIDER` env var (default: `aap`).
+All controllers use direct AAP REST API integration via the `ProvisioningProvider` interface (`pkg/provisioning/provider.go` and `pkg/aap/client.go`).
 
 ### Multi-cluster
 
@@ -119,7 +115,7 @@ Hooks are configured in `.claude/settings.json` and run automatically during age
 - **`controller-patterns.md`** — Dual-controller, reconciliation, finalizer, AAP, feedback, CRD type patterns
 - **`common-pitfalls.md`** — 10 common issues: regen, status loops, finalizers, AAP polling, NotFound, etc.
 - **`common-tasks.md`** — Adding CRDs/fields, cross-repo change order, RBAC, debugging
-- **`configuration.md`** — Environment variables for AAP, EDA, gRPC, namespaces, controller flags
+- **`configuration.md`** — Environment variables for AAP, gRPC, namespaces, controller flags
 
 ## PR Checklist
 

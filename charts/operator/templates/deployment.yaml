@@ -34,8 +34,6 @@ spec:
               name: {{ .Values.configSecret.name }}
               optional: {{ .Values.configSecret.optional }}
         env:
-          - name: OSAC_PROVISIONING_PROVIDER
-            value: {{ .Values.provisioning.provider | quote }}
           {{- if .Values.aap.url }}
           - name: OSAC_AAP_URL
             value: {{ .Values.aap.url | quote }}
