@@ -29,8 +29,13 @@ into the manager deployment). The following are supported:
 
 ### AAP provisioning
 
-All controllers provision infrastructure via direct Ansible Automation Platform REST
-API integration. The operator launches job/workflow templates and polls AAP for job status.
+Controllers that perform infrastructure provisioning (ClusterOrder, ComputeInstance,
+and networking resources) integrate with Ansible Automation Platform over the REST
+API. The operator launches job/workflow templates and polls AAP for job status.
+
+Tenant storage provisioning is optional when AAP credentials or templates are not
+configured; the Tenant reconciler still manages namespace and UDN lifecycle. Feedback
+controllers sync state to the fulfillment service over gRPC only (no AAP integration).
 
 - `OSAC_AAP_URL` — AAP server URL (required).
 - `OSAC_AAP_TOKEN` — AAP authentication token (required).
