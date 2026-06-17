@@ -64,7 +64,9 @@ var _ = Describe("Tenant Controller", func() {
 					Namespace: "default",
 				},
 			}
-			Expect(k8sClient.Create(ctx, tenant)).To(Succeed())
+			if err := k8sClient.Create(ctx, tenant); err != nil {
+				Expect(apierrors.IsAlreadyExists(err)).To(BeTrue())
+			}
 		})
 
 		AfterEach(func() {
